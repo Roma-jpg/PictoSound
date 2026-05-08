@@ -1,87 +1,125 @@
+# ===== audio_to_spectrogram.py =====
 """
-audio_to_spectrogram.py
-========================
-Encodes a stereo audio file into a single PNG spectrogram image with:
-  - A 64-pixel-wide header strip (magic bytes + manifest)
-  - Left channel spectrogram (top half)
-  - Right channel spectrogram (bottom half)
-  - Metadata zone (right side): artist, album, title as raw bytes
-  - Optional album cover (below metadata, max 1024x1024)
-
-Image format: 8-bit RGBA PNG
-
 Usage:
-    python audio_to_spectrogram.py input.mp3 [output.png]
-    If output.png is omitted, the script tries to use the song title (from metadata)
-    or falls back to the input file's basename.
+  python audio_to_spectrogram.py input.wav [options]
+
+Encodes any audio file into a PNG spectrogram with embedded metadata and cover art.
 """
 
-import numpy as np
-import librosa
-import cv2
-import sys
-import struct
-import os
+import argparse
+import json
+import logging
 import re
+import struct
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
+import librosa
+import numpy as np
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3, APIC
-from mutagen.flac import FLAC, Picture
-from mutagen.mp4 import MP4, MP4Cover
-import io
+from mutagen.id3 import ID3
 
-# ── Constants ────────────────────────────────────────────────────────────────
-HEADER_WIDTH   = 64
-N_FFT          = 2048
-HOP_LENGTH     = 512
-MIN_DB         = -80
+# ----------------------------------------------------------------------
+# constants & configuration
+# ----------------------------------------------------------------------
+HEADER_WIDTH = 64  # pixels reserved for magic + manifest (col 0..63)
+N_FFT = 2048
+HOP_LENGTH = 512
+MIN_DB = -80
 MAX_COVER_SIZE = 1024
-MAGIC          = b'\xDE\xAD\xBE\xEF\x53\x50\x45\x43'
+MAX_CANVAS_DIM = 20_000
+
+# default magic string (8 ASCII characters or 8 bytes)
+DEFAULT_MAGIC_HEX = "524f4d454f353538"
+
+# layout indices for manifest rows (stored as uint32 big-endian)
+(
+    IDX_SR,
+    IDX_NFFT,
+    IDX_HOP_LEN,
+    IDX_FREQ_BINS,
+    IDX_TIME_FRAMES,
+    IDX_SPEC_X,
+    IDX_RIGHT_Y,
+    IDX_META_X,
+    IDX_META_ZONE_W,
+    IDX_META_TEXT_ROWS,
+    IDX_COVER_Y_OFF,
+    IDX_COVER_W,
+    IDX_COVER_H,
+    IDX_COVER_PRESENT,
+    IDX_MIN_DB_RAW,
+    IDX_META_BYTE_COUNT,
+    IDX_PREEMPHASIS_GAMMA,
+    IDX_NUM_CHANNELS,
+) = range(18)
+
+VERSION_ROW, VERSION_COL = 7, 8
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
 
 
-# ── Metadata extraction from audio file ──────────────────────────────────────
+# ----------------------------------------------------------------------
+# helper functions
+# ----------------------------------------------------------------------
+def sanitize_filename(name: str) -> str:
+    """Remove illegal filesystem characters."""
+    return re.sub(r'[\\/*?:"<>|]', "", name)[:200]
 
-def extract_cover_from_mutagen(audio_file):
-    """
-    Extract cover art as a CV2 RGB image (numpy array) from any Mutagen object.
-    Returns None if no cover found.
-    """
+
+def encode_uint32_row(canvas: np.ndarray, row: int, value: int, col_start: int = 0) -> None:
+    # write a big-endian uint32 as 4 grey pixels (R=G=B=byte)
+    b = struct.pack('>I', value)
+    for i, byte in enumerate(b):
+        canvas[row, col_start + i] = [byte, byte, byte, 255]
+
+
+def write_bytes_to_zone(canvas: np.ndarray, data_bytes: bytes,
+                        x_start: int, y_start: int, zone_width: int) -> None:
+    """write bytes row-major into a pixel zone (R=G=B=byte, alpha=255)"""
+    for i, b in enumerate(data_bytes):
+        col = x_start + (i % zone_width)
+        row = y_start + (i // zone_width)
+        if row >= canvas.shape[0]:
+            log.warning("Metadata zone overflow at byte %d - truncating.", i)
+            break
+        canvas[row, col] = [b, b, b, 255]
+
+
+def extract_cover_from_mutagen(audio_file) -> Optional[np.ndarray]:
+    # extract cover art as rgb numpy array, resized if needed.
     cover_data = None
-
-    # 1) ID3 (MP3, AIFF, etc.)
-    if hasattr(audio_file, 'tags') and audio_file.tags is not None:
-        if hasattr(audio_file.tags, 'getall'):
-            for apic in audio_file.tags.getall('APIC'):
-                cover_data = apic.data
-                break
-
-    # 2) FLAC / Ogg FLAC (direct 'pictures' attribute)
-    if cover_data is None and hasattr(audio_file, 'pictures'):
-        pics = audio_file.pictures
-        if pics:
-            cover_data = pics[0].data
-
-    # 3) MP4 / M4A ('covr' atom)
-    if cover_data is None and hasattr(audio_file, 'get'):
-        covr = audio_file.get('covr')
-        if covr:
-            cover_data = covr[0]
-
-    # 4) Fallback: some containers store cover under 'APIC:' key
-    if cover_data is None and hasattr(audio_file, '__contains__'):
-        if 'APIC:' in audio_file:
-            cover_data = audio_file['APIC:'].data
+    try:
+        if hasattr(audio_file, 'tags') and audio_file.tags is not None:
+            if hasattr(audio_file.tags, 'getall'):
+                for apic in audio_file.tags.getall('APIC'):
+                    cover_data = apic.data
+                    break
+        if cover_data is None and hasattr(audio_file, 'pictures'):
+            pics = audio_file.pictures
+            if pics:
+                cover_data = pics[0].data
+        if cover_data is None and hasattr(audio_file, 'get'):
+            covr = audio_file.get('covr')
+            if covr:
+                cover_data = covr[0]
+        if cover_data is None and hasattr(audio_file, '__contains__'):
+            if 'APIC:' in audio_file:
+                cover_data = audio_file['APIC:'].data
+    except Exception:
+        return None
 
     if cover_data is None:
         return None
 
-    # Decode bytes to OpenCV image
     nparr = np.frombuffer(cover_data, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Resize if too large
     h, w = img.shape[:2]
     if h > MAX_COVER_SIZE or w > MAX_COVER_SIZE:
         scale = MAX_COVER_SIZE / max(h, w)
@@ -90,204 +128,283 @@ def extract_cover_from_mutagen(audio_file):
     return img
 
 
-def get_metadata(filepath):
-    """
-    Returns (artist, album, title, cover_image) extracted from the audio file.
-    cover_image is a numpy RGB array or None.
-    """
+def _coerce_tag_value(value):
+    # convert tag values to json-friendly scalars or string lists.
+    if value is None:
+        return ''
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if hasattr(value, 'text'):
+        text = value.text
+        if isinstance(text, list):
+            return [str(v) for v in text]
+        return str(text)
+    if hasattr(value, 'data'):
+        try:
+            return f"<binary length {len(value.data)}>"
+        except Exception:
+            return '<binary>'
+    if isinstance(value, (bytes, bytearray)):
+        return f"<binary length {len(value)}>"
+    return str(value)
+
+
+def _first_text(value) -> str:
+    # pick the first scalar text value from a tag value.
+    if isinstance(value, list):
+        return str(value[0]) if value else ''
+    if value is None:
+        return ''
+    return str(value)
+
+
+def get_all_metadata(filepath: str) -> Tuple[str, str, str, dict, str]:
+    # extract artist, album, title, full metadata dict, and original extension.
+    metadata = {}
     artist = album = title = ''
-    cover_img = None
+    ext = Path(filepath).suffix.lower()
 
     try:
-        # Open the file WITH full metadata (needed for cover art)
-        full_meta = MutagenFile(filepath, easy=False)
-        if full_meta is None:
-            print("Warning: No metadata tags found.")
-            return artist, album, title, cover_img
+        audio = MutagenFile(filepath, easy=False)
+        if audio is None:
+            return artist, album, title, metadata, ext
 
-        # ----- Text metadata extraction -----
-        # Try EasyID3 first if it's an MP3 (most convenient)
-        if hasattr(full_meta, 'info') and full_meta.mime[0] == 'audio/mpeg':
-            try:
-                from mutagen.easyid3 import EasyID3
-                easy = EasyID3(filepath)
-                artist = easy.get('artist', [''])[0]
-                album  = easy.get('album', [''])[0]
-                title  = easy.get('title', [''])[0]
-            except Exception:
-                pass
+        tags = getattr(audio, 'tags', None)
+        if isinstance(tags, ID3):
+            for key, frame in tags.items():
+                if key == 'APIC':
+                    continue
+                value = _coerce_tag_value(frame)
+                metadata[f'id3_{key}'] = value
+                if key == 'TPE1' and not artist:
+                    artist = _first_text(value)
+                elif key == 'TALB' and not album:
+                    album = _first_text(value)
+                elif key == 'TIT2' and not title:
+                    title = _first_text(value)
+        elif tags is not None and hasattr(tags, 'items'):
+            for key, value in tags.items():
+                metadata[key] = _coerce_tag_value(value)
+                lower_key = key.lower()
+                if lower_key == 'artist' and not artist:
+                    artist = _first_text(metadata[key])
+                elif lower_key == 'album' and not album:
+                    album = _first_text(metadata[key])
+                elif lower_key == 'title' and not title:
+                    title = _first_text(metadata[key])
 
-        # Fallback for other formats (FLAC, MP4, OGG, etc.)
-        if not artist and hasattr(full_meta, 'get'):
-            artist = full_meta.get('artist', [''])[0] if full_meta.get('artist') else ''
-            album  = full_meta.get('album', [''])[0] if full_meta.get('album') else ''
-            title  = full_meta.get('title', [''])[0] if full_meta.get('title') else ''
+        # mp4 / other tag containers may expose keys() + get()
+        if hasattr(audio, 'keys') and hasattr(audio, 'get') and tags is not None and not isinstance(tags, ID3):
+            for key in audio.keys():
+                try:
+                    if key in metadata:
+                        continue
+                    value = audio.get(key)
+                    if value is not None:
+                        metadata[key] = _coerce_tag_value(value)
+                except Exception:
+                    pass
 
-        # Second fallback: try ID3 frames directly (for files with ID3 but not EasyID3)
-        if not artist and hasattr(full_meta, 'tags') and full_meta.tags:
-            tags = full_meta.tags
-            tpe1 = tags.get('TPE1')
-            if tpe1 and hasattr(tpe1, 'text'):
-                artist = str(tpe1.text[0])
-            talb = tags.get('TALB')
-            if talb and hasattr(talb, 'text'):
-                album = str(talb.text[0])
-            tit2 = tags.get('TIT2')
-            if tit2 and hasattr(tit2, 'text'):
-                title = str(tit2.text[0])
+        # technical
+        if hasattr(audio, 'info') and audio.info is not None:
+            if hasattr(audio.info, 'length'):
+                metadata['length_seconds'] = float(audio.info.length)
+            if hasattr(audio.info, 'bitrate'):
+                metadata['bitrate_bps'] = int(audio.info.bitrate)
 
-        # ----- Cover extraction (always use full_meta, not the easy one) -----
-        cover_img = extract_cover_from_mutagen(full_meta)
-
-        if cover_img is not None:
-            print(f"  Cover found: {cover_img.shape[1]}x{cover_img.shape[0]} px")
-        else:
-            print("  No cover art found.")
+        # convenience fields - actually mutate the variables
+        artist = _first_text(metadata.get('artist', metadata.get('TPE1', metadata.get('id3_TPE1', artist))))
+        album = _first_text(metadata.get('album', metadata.get('TALB', metadata.get('id3_TALB', album))))
+        title = _first_text(metadata.get('title', metadata.get('TIT2', metadata.get('id3_TIT2', title))))
 
     except Exception as e:
-        print(f"Warning: Could not read metadata: {e}")
+        log.warning("Error reading metadata: %s", e)
 
-    return artist, album, title, cover_img
+    # remove overly long strings
+    for k, v in list(metadata.items()):
+        if isinstance(v, str) and len(v) > 10000:
+            log.warning("Skipping field '%s' (too long)", k)
+            del metadata[k]
 
-# ── Spectrogram and canvas helpers ───────────────────────────────────────────
-
-def encode_uint32_row(canvas, row, value, col_start=0):
-    b = struct.pack('>I', value)
-    for i, byte in enumerate(b):
-        canvas[row, col_start + i] = [byte, byte, byte, 255]
+    return artist, album, title, metadata, ext
 
 
-def audio_to_spectrogram(y):
-    stft = librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH)
-    mag_db = librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+def audio_to_spectrogram(y: np.ndarray, preemphasis_gamma: float = 0.0) -> np.ndarray:
+    # convert audio to normalized magnitude spectrogram (0..255)
+    stft = librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann')
+    mag = np.abs(stft)
+    if preemphasis_gamma > 0:
+        mag = mag ** preemphasis_gamma
+    mag_db = librosa.amplitude_to_db(mag, ref=np.max)
     mag_db = np.clip(mag_db, MIN_DB, 0)
     norm = (mag_db - MIN_DB) / (-MIN_DB)
     return (norm * 255).astype(np.uint8)
 
 
-def encode_metadata_bytes(artist='', album='', title=''):
+def encode_metadata_json(artist: str, album: str, title: str,
+                         full_metadata: dict, original_ext: str) -> bytes:
+    # version 1 metadata: json with all tags + original extension.
+    payload = json.dumps({
+        'artist': artist,
+        'album': album,
+        'title': title,
+        'original_extension': original_ext,
+        'full_metadata': full_metadata,
+    }, ensure_ascii=False).encode('utf-8')
+    return struct.pack('>I', len(payload)) + payload
+
+
+def encode_metadata_old(artist: str, album: str, title: str) -> bytes:
+    # legacy null-separated format (version 0)
     payload = f"{artist}\x00{album}\x00{title}\x00".encode('utf-8')
     return struct.pack('>I', len(payload)) + payload
 
 
-def write_bytes_to_zone(canvas, data_bytes, x_start, y_start, zone_width):
-    for i, b in enumerate(data_bytes):
-        col = x_start + (i % zone_width)
-        row = y_start + (i // zone_width)
-        if row >= canvas.shape[0]:
-            print(f"Warning: metadata overflow at byte {i}")
-            break
-        canvas[row, col] = [b, b, b, 255]
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Encode audio to spectrogram PNG")
+    parser.add_argument("input_audio", help="Input audio file")
+    parser.add_argument("output_image", nargs="?", default=None,
+                        help="Output PNG filename (default: derived from title)")
+    parser.add_argument("--preemphasis", type=float, default=0.0,
+                        help="Spectrogram power law gamma (e.g. 0.33); enables version 1")
+    parser.add_argument("--metadata-format", choices=['old', 'json'], default='json',
+                        help="Metadata encoding (default: json, version 1)")
+    parser.add_argument("--magic", default=DEFAULT_MAGIC_HEX,
+                        help=f"Magic signature as hex string (default: {DEFAULT_MAGIC_HEX})")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
 
-def sanitize_filename(name):
-    """Remove invalid characters for a file name."""
-    return re.sub(r'[\\/*?:"<>|]', "", name)[:200]
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+    # convert hex magic to bytes (must be 8 bytes)
+    try:
+        magic_bytes = bytes.fromhex(args.magic)
+        if len(magic_bytes) != 8:
+            raise ValueError
+    except Exception:
+        sys.exit(f"Error: --magic must be a 16-character hex string (8 bytes), got '{args.magic}'")
+    log.info("Using magic: %s", magic_bytes.hex())
 
-def main(input_audio, output_image=None):
-    print(f"Loading audio: {input_audio}")
+    # load audio
+    log.info("Loading: %s", args.input_audio)
+    artist, album, title, full_meta, orig_ext = get_all_metadata(args.input_audio)
+    log.info("Artist: %s | Album: %s | Title: %s | Ext: %s",
+             artist or '-', album or '-', title or '-', orig_ext)
 
-    # Extract metadata and cover from file
-    artist, album, title, cover = get_metadata(input_audio)
-
-    # If output_image not provided, generate from song title or input basename
-    if output_image is None:
-        base = ""
-        if title:
-            base = sanitize_filename(title)
-        else:
-            base = os.path.splitext(os.path.basename(input_audio))[0]
-        output_image = f"{base}.png"
-        print(f"Output PNG not specified, using: {output_image}")
-
-    # Load audio
-    y_stereo, sr = librosa.load(input_audio, sr=None, mono=False)
-
-    # Ensure stereo
-    if y_stereo.ndim == 1 or y_stereo.shape[0] == 1:
-        print("Mono source detected — duplicating channel.")
-        if y_stereo.ndim == 1:
-            y_stereo = np.stack([y_stereo, y_stereo])
-        else:
-            y_stereo = np.stack([y_stereo[0], y_stereo[0]])
+    y_stereo, sr = librosa.load(args.input_audio, sr=None, mono=False)
+    if y_stereo.ndim == 1:
+        log.info("Mono source - duplicating channel")
+        y_stereo = np.stack([y_stereo, y_stereo])
     elif y_stereo.shape[0] > 2:
-        print(f"Warning: {y_stereo.shape[0]} channels, using first two.")
+        log.warning("%d channels found - using first two", y_stereo.shape[0])
         y_stereo = y_stereo[:2]
-
+    num_channels = y_stereo.shape[0]
     y_left, y_right = y_stereo[0], y_stereo[1]
 
-    print("Computing spectrograms…")
-    spec_left = audio_to_spectrogram(y_left)
-    spec_right = audio_to_spectrogram(y_right)
+    # version logic
+    preemphasis = args.preemphasis if args.preemphasis > 0 else 0.0
+    version = 1 if (preemphasis > 0 or args.metadata_format == 'json') else 0
 
-    freq_bins = spec_left.shape[0]
-    time_frames = spec_left.shape[1]
+    # spectrograms
+    log.info("Computing spectrograms (gamma=%.3f)...", preemphasis)
+    spec_left = audio_to_spectrogram(y_left, preemphasis)
+    spec_right = audio_to_spectrogram(y_right, preemphasis)
+    freq_bins, time_frames = spec_left.shape
 
-    # Prepare metadata bytes
-    meta_bytes = encode_metadata_bytes(artist, album, title)
+    # metadata block
+    if version >= 1 and args.metadata_format == 'json':
+        meta_bytes = encode_metadata_json(artist, album, title, full_meta, orig_ext)
+    else:
+        meta_bytes = encode_metadata_old(artist, album, title)
 
-    # Canvas dimensions
-    img_height = freq_bins * 2
+    # cover
+    cover = None
+    try:
+        audio_file = MutagenFile(args.input_audio, easy=False)
+        if audio_file:
+            cover = extract_cover_from_mutagen(audio_file)
+    except Exception as e:
+        log.warning("Cover extraction failed: %s", e)
+
     cover_h, cover_w = (cover.shape[:2] if cover is not None else (0, 0))
+
+    # metadata zone layout
     meta_zone_w = max(cover_w, 256, 64)
     meta_text_rows = (len(meta_bytes) + meta_zone_w - 1) // meta_zone_w
-    cover_y_in_meta = meta_text_rows
-    img_width = HEADER_WIDTH + time_frames + meta_zone_w
+    cover_y_offset = meta_text_rows  # placed right after text zone
 
-    print(f"Canvas: {img_width} x {img_height} px")
+    # canvas dimensions
+    img_width = HEADER_WIDTH + time_frames + meta_zone_w
+    img_height = freq_bins * 2
+    cover_bottom = cover_y_offset + cover_h
+    if cover_bottom > img_height:
+        img_height = cover_bottom
+
+    if img_height > MAX_CANVAS_DIM or img_width > MAX_CANVAS_DIM:
+        sys.exit("Canvas too large - aborting.")
+
+    log.info("Canvas %dx%d px", img_width, img_height)
     canvas = np.zeros((img_height, img_width, 4), dtype=np.uint8)
     canvas[:, :, 3] = 255
 
-    # Spectrograms
+    # ---- magic signature (rows 0..7, col 0 only) ----
+    for row, byte in enumerate(magic_bytes):
+        canvas[row, 0] = [byte, byte, byte, 255]
+
+    # ---- version byte at row 7, col 8 ----
+    canvas[VERSION_ROW, VERSION_COL] = [version, version, version, 255]
+
+    # ---- manifest (rows 8..25, cols 0..3) ----
+    min_db_raw = struct.unpack('>I', struct.pack('>i', MIN_DB))[0]
+    manifest = [
+        sr, N_FFT, HOP_LENGTH, freq_bins, time_frames,
+        HEADER_WIDTH, freq_bins, HEADER_WIDTH + time_frames, meta_zone_w,
+        meta_text_rows, cover_y_offset, cover_w, cover_h,
+        1 if cover is not None else 0,
+        min_db_raw,
+        len(meta_bytes),
+        int(preemphasis * 1000) if version >= 1 else 0,
+        num_channels,
+    ]
+    for idx, val in enumerate(manifest):
+        encode_uint32_row(canvas, 8 + idx, val, col_start=0)
+
+    # ---- spectrograms ----
     spec_x = HEADER_WIDTH
     left_rgb = np.stack([spec_left[::-1]] * 3, axis=-1)
     right_rgb = np.stack([spec_right[::-1]] * 3, axis=-1)
-    canvas[0:freq_bins, spec_x:spec_x+time_frames, :3] = left_rgb
-    canvas[freq_bins:freq_bins*2, spec_x:spec_x+time_frames, :3] = right_rgb
+    canvas[0:freq_bins, spec_x:spec_x + time_frames, :3] = left_rgb
+    canvas[freq_bins:freq_bins * 2, spec_x:spec_x + time_frames, :3] = right_rgb
 
-    # Metadata text zone
+    # ---- metadata text zone (starts at row 0, col meta_x) ----
     meta_x = HEADER_WIDTH + time_frames
     write_bytes_to_zone(canvas, meta_bytes, meta_x, 0, meta_zone_w)
 
-    # Cover image
+    # ---- cover art (if any) ----
     if cover is not None:
-        cy = cover_y_in_meta
-        canvas[cy:cy+cover_h, meta_x:meta_x+cover_w, :3] = cover
-        canvas[cy:cy+cover_h, meta_x:meta_x+cover_w, 3] = 255
+        cy = cover_y_offset
+        canvas[cy:cy + cover_h, meta_x:meta_x + cover_w, :3] = cover
+        canvas[cy:cy + cover_h, meta_x:meta_x + cover_w, 3] = 255
+        log.info("Cover placed at row %d, %dx%d px", cy, cover_w, cover_h)
 
-    # Header magic and manifest
-    for i, b in enumerate(MAGIC):
-        canvas[i, 0] = [b, b, b, 255]
+    # ---- save PNG ----
+    out_path = args.output_image
+    if out_path is None:
+        base = sanitize_filename(title) if title else Path(args.input_audio).stem
+        out_path = f"{base}.png"
+        log.info("Output image: %s", out_path)
 
-    manifest = [
-        sr, N_FFT, HOP_LENGTH, freq_bins, time_frames,
-        HEADER_WIDTH, freq_bins, meta_x, meta_zone_w,
-        meta_text_rows, cover_y_in_meta, cover_w, cover_h,
-        1 if cover is not None else 0,
-        MIN_DB & 0xFFFFFFFF,
-        len(meta_bytes)
-    ]
-    for row_offset, value in enumerate(manifest):
-        encode_uint32_row(canvas, 8 + row_offset, value, col_start=0)
-
-    # Save
+    # convert RGBA to BGRA for OpenCV
     out_bgra = cv2.cvtColor(canvas, cv2.COLOR_RGBA2BGRA)
-    cv2.imwrite(output_image, out_bgra)
-    print(f"Saved spectrogram: {output_image}")
-    print(f"  Sample rate: {sr} Hz")
-    print(f"  Freq bins: {freq_bins}, Time frames: {time_frames}")
-    print(f"  Artist: {artist or '(none)'}")
-    print(f"  Album : {album or '(none)'}")
-    print(f"  Title : {title or '(none)'}")
-    if cover is not None:
-        print(f"  Cover: {cover_w}x{cover_h}")
+    cv2.imwrite(out_path, out_bgra)
+    log.info("Saved: %s", out_path)
+    log.info("Sample rate: %d, bins: %d, frames: %d, channels: %d",
+             sr, freq_bins, time_frames, num_channels)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
-        print("Usage: python audio_to_spectrogram.py input.mp3 [output.png]")
-        sys.exit(1)
-    input_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) == 3 else None
-    main(input_path, output_path)
+    main()
